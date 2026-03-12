@@ -121,44 +121,58 @@ export default function Workspace({ session }) {
     setStep('processing'); setError(''); setRows([]); setCsvStr('')
 
     try {
-      // Step 1 — create job record in Supabase
+      // Step 1 — create job record in Supabase (safe parse, no .json() crash)
       setStatusMsg('Creating job…')
-      const createRes = await fetch('/api/jobs/create', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ pdf_name: file.name, category_id: categoryId }),
-      })
-      const createData = await createRes.json()
-      if (!createRes.ok) throw new Error(createData.error || 'Failed to create job')
-      const jid = createData.job_id
-      setJobId(jid)
+      let jid = null
+      try {
+        const createRes  = await fetch('/api/jobs/create', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pdf_name: file.name, category_id: categoryId }),
+        })
+        const createText = await createRes.text()
+        let   createData = {}
+        try { createData = JSON.parse(createText) } catch {}
+        if (createRes.ok && createData.job_id) { jid = createData.job_id; setJobId(jid) }
+        // non-critical — continue even if job creation fails
+      } catch {}
 
-      // Step 2 — extract text with pdf.js
+      // Step 2 — extract text with pdf.js (runs in browser, no server needed)
       setStatusMsg('Reading PDF pages…')
       const { pages, total } = await extractPdfText(file)
-      setStatusMsg(`Extracted text from ${pages.length}/${total} pages. Sending to AI…`)
+      setStatusMsg(`Read ${pages.length} pages. Sending to AI…`)
 
-      // Step 3 — call OpenAI via /api/extract
-      const extractRes = await fetch('/api/extract', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          job_id:    jid,
-          pdf_name:  file.name,
-          category:  categoryName,
-          pages,
-        }),
-      })
+      // Step 3 — call OpenAI in batches of 25 pages (fits 10s Vercel limit)
+      const CHUNK        = 25
+      const allExtracted = []
+      const totalChunks  = Math.ceil(pages.length / CHUNK)
 
-      const extractText = await extractRes.text()
-      let extractData
-      try { extractData = JSON.parse(extractText) }
-      catch { throw new Error(`Bad response from AI: ${extractText.slice(0, 200)}`) }
+      for (let start = 0; start < pages.length; start += CHUNK) {
+        const chunk    = pages.slice(start, start + CHUNK)
+        const chunkNum = Math.floor(start / CHUNK) + 1
+        setStatusMsg(
+          totalChunks > 1
+            ? `AI extracting pages ${start + 1}–${Math.min(start + CHUNK, pages.length)} of ${pages.length} (batch ${chunkNum}/${totalChunks})…`
+            : `AI extracting ${pages.length} pages…`
+        )
 
-      if (!extractRes.ok) throw new Error(extractData.error || 'Extraction failed')
+        const extractRes  = await fetch('/api/extract', {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ category: categoryName, pages: chunk }),
+        })
 
-      const extracted = extractData.products || []
-      if (!extracted.length) throw new Error('No products found in this PDF.')
+        const extractText = await extractRes.text()
+        let   extractData = {}
+        try { extractData = JSON.parse(extractText) }
+        catch { throw new Error(`Server error (batch ${chunkNum}): ${extractText.slice(0, 300)}`) }
+
+        if (!extractRes.ok) throw new Error(extractData.error || `Extraction failed on batch ${chunkNum}`)
+        allExtracted.push(...(extractData.products || []))
+      }
+
+      const extracted = allExtracted
+      if (!extracted.length) throw new Error('No products found — the PDF may not contain product listings with product codes.')
 
       const csv = rowsToCsv(extracted)
 
