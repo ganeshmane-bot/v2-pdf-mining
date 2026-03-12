@@ -44,7 +44,7 @@ export default async function handler(req, res) {
   if (!pages.length) return res.status(400).json({ error: 'No pages provided' })
 
   const apiKey = process.env.OPENAI_API_KEY
-  const model  = process.env.OPENAI_MODEL || 'gpt-4o-mini'
+  const model  = process.env.OPENAI_MODEL || 'gpt-4o'
   if (!apiKey) return res.status(500).json({ error: 'OPENAI_API_KEY not set' })
 
   const columns = COLUMNS[category.toLowerCase()] || COLUMNS.default
