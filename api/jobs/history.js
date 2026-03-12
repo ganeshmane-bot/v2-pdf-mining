@@ -1,22 +1,38 @@
-// api/jobs/history.js — returns recent jobs with category name joined
+const ONE_DAY_MS = 24 * 60 * 60 * 1000
+
 export default async function handler(req, res) {
   const SB_URL = process.env.VITE_SUPABASE_URL
   const SB_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY
 
-  const r = await fetch(
-    `${SB_URL}/rest/v1/jobs?select=id,pdf_name,status,row_count,csv_output,created_at,categories(name)&order=created_at.desc&limit=20`,
-    { headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}` } }
-  )
+  if (!SB_URL || !SB_KEY) {
+    return res.status(500).json({ error: 'Supabase environment variables are not set.' })
+  }
 
-  const data = await r.json()
-  if (!Array.isArray(data)) return res.status(200).json([])
+  const cutoff = new Date(Date.now() - ONE_DAY_MS).toISOString()
+  const authHeaders = { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}` }
 
-  // Flatten category name
-  const flat = data.map(j => ({
-    ...j,
-    category_name: j.categories?.name || '',
-    categories: undefined,
-  }))
+  try {
+    await fetch(`${SB_URL}/rest/v1/jobs?created_at=lt.${encodeURIComponent(cutoff)}`, {
+      method: 'DELETE',
+      headers: authHeaders,
+    }).catch(() => {})
 
-  return res.status(200).json(flat)
+    const r = await fetch(
+      `${SB_URL}/rest/v1/jobs?select=id,pdf_name,status,row_count,csv_output,created_at,completed_at,categories(name)&created_at=gte.${encodeURIComponent(cutoff)}&order=created_at.desc&limit=100`,
+      { headers: authHeaders }
+    )
+
+    const data = await r.json()
+    if (!Array.isArray(data)) return res.status(200).json([])
+
+    const flat = data.map(job => ({
+      ...job,
+      category_name: job.categories?.name || '',
+      categories: undefined,
+    }))
+
+    return res.status(200).json(flat)
+  } catch (error) {
+    return res.status(500).json({ error: String(error?.message || error) })
+  }
 }
