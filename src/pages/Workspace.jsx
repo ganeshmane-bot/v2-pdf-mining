@@ -1,226 +1,316 @@
-// Workspace.jsx — 3-step flow:
-// 1. Upload PDF + pick category → click Extract
-// 2. Browser extracts all text with pdf.js → sends to /api/extract
-// 3. Show results table + download CSV button + save history
-
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { supabase } from '../lib/supabase.js'
 
 const PDFJS = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js'
 const WORKER = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'
+const ONE_MINUTE = 60 * 1000
+const CHUNK_SIZE = 4
 
-// ── Load pdf.js once ──────────────────────────────────────────
 async function loadPdfJs() {
   if (window.pdfjsLib) return window.pdfjsLib
-  await new Promise((res, rej) => {
+
+  await new Promise((resolve, reject) => {
     const s = document.createElement('script')
-    s.src = PDFJS; s.onload = res; s.onerror = rej
+    s.src = PDFJS
+    s.onload = resolve
+    s.onerror = reject
     document.head.appendChild(s)
   })
+
   window.pdfjsLib.GlobalWorkerOptions.workerSrc = WORKER
   return window.pdfjsLib
 }
 
-// ── Extract all text from PDF ─────────────────────────────────
-async function extractPdfText(file) {
-  const pdfjs   = await loadPdfJs()
-  const buffer  = await file.arrayBuffer()
-  const pdfDoc  = await pdfjs.getDocument({ data: buffer }).promise
-  const n       = pdfDoc.numPages
-  const pages   = []
+async function renderPageToDataUrl(page, maxWidth = 1100, quality = 0.68) {
+  const baseViewport = page.getViewport({ scale: 1 })
+  const scale = Math.min(1.6, maxWidth / Math.max(baseViewport.width, 1))
+  const viewport = page.getViewport({ scale })
+  const canvas = document.createElement('canvas')
+  const ctx = canvas.getContext('2d', { alpha: false })
 
-  for (let i = 1; i <= n; i++) {
-    const page    = await pdfDoc.getPage(i)
-    const content = await page.getTextContent()
-    const text    = content.items.map(item => item.str).join(' ').replace(/\s+/g, ' ').trim()
-    if (text.length > 20) {      // skip blank pages
-      pages.push({ page_no: i, text: text.slice(0, 4000) })   // cap per page
-    }
-  }
-  return { pages, total: n }
+  canvas.width = Math.max(1, Math.floor(viewport.width))
+  canvas.height = Math.max(1, Math.floor(viewport.height))
+
+  await page.render({ canvasContext: ctx, viewport }).promise
+  const dataUrl = canvas.toDataURL('image/jpeg', quality)
+
+  canvas.width = 0
+  canvas.height = 0
+  return dataUrl
 }
 
-// ── Convert JSON rows → CSV string ───────────────────────────
+async function extractPdfPages(file, onProgress) {
+  const pdfjs = await loadPdfJs()
+  const buffer = await file.arrayBuffer()
+  const pdfDoc = await pdfjs.getDocument({ data: buffer }).promise
+  const total = pdfDoc.numPages
+  const pages = []
+
+  for (let i = 1; i <= total; i++) {
+    const page = await pdfDoc.getPage(i)
+    const content = await page.getTextContent()
+    const text = content.items.map(item => item.str).join(' ').replace(/\s+/g, ' ').trim()
+    const image_data_url = await renderPageToDataUrl(page)
+
+    pages.push({
+      page_no: i,
+      text: text.slice(0, 3500),
+      image_data_url,
+    })
+
+    onProgress?.(i, total)
+    page.cleanup()
+  }
+
+  return { pages, total }
+}
+
 function rowsToCsv(rows) {
   if (!rows.length) return ''
+
   const headers = Object.keys(rows[0])
-  const escape  = v => {
-    const s = String(v ?? '')
-    return s.includes(',') || s.includes('"') || s.includes('\n')
-      ? `"${s.replace(/"/g, '""')}"` : s
+
+  const normalizeCell = value => {
+    if (Array.isArray(value)) return value.join(' | ')
+    if (value && typeof value === 'object') return JSON.stringify(value)
+    return String(value ?? '')
   }
+
+  const escape = value => {
+    const s = normalizeCell(value)
+    return s.includes(',') || s.includes('"') || s.includes('\n')
+      ? `"${s.replace(/"/g, '""')}"`
+      : s
+  }
+
   return [
     headers.join(','),
-    ...rows.map(r => headers.map(h => escape(r[h])).join(',')),
+    ...rows.map(row => headers.map(header => escape(row[header])).join(',')),
   ].join('\n')
 }
 
-// ── Download helper ───────────────────────────────────────────
 function downloadCsv(csv, filename) {
-  const blob = new Blob([csv], { type: 'text/csv' })
-  const url  = URL.createObjectURL(blob)
-  const a    = document.createElement('a')
-  a.href = url; a.download = filename; a.click()
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  a.click()
   URL.revokeObjectURL(url)
 }
 
-// ── Category colours ──────────────────────────────────────────
 const CAT_COLORS = {
-  tiles: '#f59e0b', laminates: '#10b981', panels: '#3b82f6',
-  louvers: '#8b5cf6', wallpapers: '#ec4899', quartz: '#f97316',
+  tiles: '#f59e0b',
+  laminates: '#10b981',
+  panels: '#3b82f6',
+  louvers: '#8b5cf6',
+  wallpapers: '#ec4899',
+  quartz: '#f97316',
+  custom: '#94a3b8',
 }
 
-// ══════════════════════════════════════════════════════════════
 export default function Workspace({ session }) {
-  const [categories,  setCategories]  = useState([])
-  const [history,     setHistory]     = useState([])    // past jobs
-  const [file,        setFile]        = useState(null)
-  const [categoryId,  setCategoryId]  = useState('')
-  const [categoryName, setCatName]    = useState('')
-  const [dragging,    setDragging]    = useState(false)
+  const fileInputRef = useRef(null)
 
-  // Processing state
-  const [step,       setStep]       = useState('idle')  // idle | processing | done | error
-  const [statusMsg,  setStatusMsg]  = useState('')
-  const [rows,       setRows]       = useState([])
-  const [csvStr,     setCsvStr]     = useState('')
-  const [jobId,      setJobId]      = useState(null)
-  const [error,      setError]      = useState('')
+  const [categories, setCategories] = useState([])
+  const [history, setHistory] = useState([])
+  const [file, setFile] = useState(null)
+  const [categoryId, setCategoryId] = useState('')
+  const [categoryName, setCategoryName] = useState('')
+  const [customCategoryMode, setCustomCategoryMode] = useState(false)
+  const [customCategoryName, setCustomCategoryName] = useState('')
+  const [dragging, setDragging] = useState(false)
 
-  // Table view state
-  const [page,       setPage]       = useState(0)
+  const [step, setStep] = useState('idle')
+  const [statusMsg, setStatusMsg] = useState('')
+  const [rows, setRows] = useState([])
+  const [csvStr, setCsvStr] = useState('')
+  const [jobId, setJobId] = useState(null)
+  const [error, setError] = useState('')
+  const [page, setPage] = useState(0)
+
   const ROW_PER_PAGE = 20
-
-  const email    = session?.user?.email || ''
+  const email = session?.user?.email || ''
   const initials = email.split('@')[0].slice(0, 2).toUpperCase()
 
-  // ── Load categories + history ─────────────────────────────
+  const activeCategoryName = useMemo(() => {
+    const value = customCategoryMode ? customCategoryName : categoryName
+    return String(value || '').trim().toLowerCase().replace(/\s+/g, ' ')
+  }, [customCategoryMode, customCategoryName, categoryName])
+
+  const canRun = Boolean(file) && Boolean(activeCategoryName) && step !== 'processing'
+
+  const loadHistory = useCallback(() => {
+    fetch('/api/jobs/history')
+      .then(r => r.json())
+      .then(data => { if (Array.isArray(data)) setHistory(data) })
+      .catch(() => {})
+  }, [])
+
   useEffect(() => {
     fetch('/api/categories')
       .then(r => r.json())
-      .then(d => { if (Array.isArray(d)) setCategories(d) })
+      .then(data => { if (Array.isArray(data)) setCategories(data) })
       .catch(() => {})
 
-    fetch('/api/jobs/history')
-      .then(r => r.json())
-      .then(d => { if (Array.isArray(d)) setHistory(d) })
-      .catch(() => {})
+    loadHistory()
+    const interval = setInterval(loadHistory, ONE_MINUTE)
+    return () => clearInterval(interval)
+  }, [loadHistory])
+
+  const onDrop = useCallback(event => {
+    event.preventDefault()
+    setDragging(false)
+
+    const dropped = event.dataTransfer.files[0]
+    if (dropped?.type === 'application/pdf') {
+      setFile(dropped)
+      setStep('idle')
+      setError('')
+    } else {
+      setError('Please upload a PDF file only.')
+    }
   }, [])
 
-  // ── File drop ────────────────────────────────────────────
-  const onDrop = useCallback(e => {
-    e.preventDefault(); setDragging(false)
-    const f = e.dataTransfer.files[0]
-    if (f?.type === 'application/pdf') { setFile(f); setStep('idle'); setError('') }
-    else setError('Please drop a PDF file.')
-  }, [])
-
-  // ── Main extract flow ─────────────────────────────────────
   async function runExtraction() {
-    if (!file || !categoryId) return
-    setStep('processing'); setError(''); setRows([]); setCsvStr('')
+    if (!canRun) return
+
+    setStep('processing')
+    setError('')
+    setRows([])
+    setCsvStr('')
+    setPage(0)
 
     try {
-      // Step 1 — create job record in Supabase (safe parse, no .json() crash)
-      setStatusMsg('Creating job…')
+      setStatusMsg('Creating extraction job…')
       let jid = null
+
       try {
-        const createRes  = await fetch('/api/jobs/create', {
+        const createRes = await fetch('/api/jobs/create', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ pdf_name: file.name, category_id: categoryId }),
+          body: JSON.stringify({
+            pdf_name: file.name,
+            category_id: customCategoryMode ? null : categoryId,
+            custom_category_name: customCategoryMode ? customCategoryName : '',
+          }),
         })
+
         const createText = await createRes.text()
-        let   createData = {}
+        let createData = {}
         try { createData = JSON.parse(createText) } catch {}
-        if (createRes.ok && createData.job_id) { jid = createData.job_id; setJobId(jid) }
-        // non-critical — continue even if job creation fails
+
+        if (createRes.ok && createData.job_id) {
+          jid = createData.job_id
+          setJobId(jid)
+        }
       } catch {}
 
-      // Step 2 — extract text with pdf.js (runs in browser, no server needed)
-      setStatusMsg('Reading PDF pages…')
-      const { pages, total } = await extractPdfText(file)
-      setStatusMsg(`Read ${pages.length} pages. Sending to AI…`)
+      setStatusMsg('Reading PDF pages, images, and embedded text…')
+      const { pages } = await extractPdfPages(file, (current, total) => {
+        setStatusMsg(`Preparing page ${current} of ${total}…`)
+      })
 
-      // Step 3 — call OpenAI in batches of 25 pages (fits 10s Vercel limit)
-      const CHUNK        = 25
-      const allExtracted = []
-      const totalChunks  = Math.ceil(pages.length / CHUNK)
+      let memory = {}
+      const extracted = []
+      const totalChunks = Math.ceil(pages.length / CHUNK_SIZE)
 
-      for (let start = 0; start < pages.length; start += CHUNK) {
-        const chunk    = pages.slice(start, start + CHUNK)
-        const chunkNum = Math.floor(start / CHUNK) + 1
-        setStatusMsg(
-          totalChunks > 1
-            ? `AI extracting pages ${start + 1}–${Math.min(start + CHUNK, pages.length)} of ${pages.length} (batch ${chunkNum}/${totalChunks})…`
-            : `AI extracting ${pages.length} pages…`
-        )
+      for (let start = 0; start < pages.length; start += CHUNK_SIZE) {
+        const chunk = pages.slice(start, start + CHUNK_SIZE)
+        const batchNo = Math.floor(start / CHUNK_SIZE) + 1
 
-        const extractRes  = await fetch('/api/extract', {
-          method:  'POST',
+        setStatusMsg(`AI analyzing pages ${chunk[0].page_no}-${chunk[chunk.length - 1].page_no} (batch ${batchNo}/${totalChunks})…`)
+
+        const extractRes = await fetch('/api/extract', {
+          method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body:    JSON.stringify({ category: categoryName, pages: chunk }),
+          body: JSON.stringify({
+            category: activeCategoryName,
+            pages: chunk,
+            memory,
+          }),
         })
 
         const extractText = await extractRes.text()
-        let   extractData = {}
-        try { extractData = JSON.parse(extractText) }
-        catch { throw new Error(`Server error (batch ${chunkNum}): ${extractText.slice(0, 300)}`) }
+        let extractData = {}
+        try {
+          extractData = JSON.parse(extractText)
+        } catch {
+          throw new Error(`Server error in batch ${batchNo}: ${extractText.slice(0, 300)}`)
+        }
 
-        if (!extractRes.ok) throw new Error(extractData.error || `Extraction failed on batch ${chunkNum}`)
-        allExtracted.push(...(extractData.products || []))
+        if (!extractRes.ok) {
+          throw new Error(extractData.error || `Extraction failed in batch ${batchNo}`)
+        }
+
+        if (extractData.memory) memory = extractData.memory
+        if (Array.isArray(extractData.products)) extracted.push(...extractData.products)
       }
 
-      const extracted = allExtracted
-      if (!extracted.length) throw new Error('No products found — the PDF may not contain product listings with product codes.')
+      if (!extracted.length) {
+        throw new Error('No products found — now the extractor checks image pages too, so this PDF likely has no usable product pages or the prompt rules still need one more tuning pass for this layout.')
+      }
+
+      extracted.sort((a, b) => {
+        const pageDiff = Number(a.page_no || 0) - Number(b.page_no || 0)
+        if (pageDiff !== 0) return pageDiff
+        return String(a.sku || '').localeCompare(String(b.sku || ''))
+      })
 
       const csv = rowsToCsv(extracted)
 
-      // Step 4 — save result to Supabase
-      setStatusMsg('Saving results…')
-      await fetch('/api/jobs/complete', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ job_id: jid, row_count: extracted.length, csv_output: csv }),
-      }).catch(() => {})   // non-critical
+      setStatusMsg('Saving extraction history…')
+      if (jid) {
+        await fetch('/api/jobs/complete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ job_id: jid, row_count: extracted.length, csv_output: csv }),
+        }).catch(() => {})
+      }
 
       setRows(extracted)
       setCsvStr(csv)
-      setPage(0)
       setStep('done')
       setStatusMsg(`Done — ${extracted.length} products extracted`)
-
-      // Refresh history
-      fetch('/api/jobs/history').then(r => r.json()).then(d => { if (Array.isArray(d)) setHistory(d) }).catch(() => {})
-
+      loadHistory()
     } catch (err) {
-      setError(err.message)
+      setError(String(err?.message || err))
       setStep('error')
     }
   }
 
-  async function logout() { await supabase.auth.signOut() }
+  async function logout() {
+    await supabase.auth.signOut()
+  }
 
-  // ── Derived table data ────────────────────────────────────
-  const columns    = rows.length ? Object.keys(rows[0]) : []
+  const columns = rows.length ? Object.keys(rows[0]) : []
   const totalPages = Math.ceil(rows.length / ROW_PER_PAGE)
-  const pageRows   = rows.slice(page * ROW_PER_PAGE, (page + 1) * ROW_PER_PAGE)
+  const pageRows = rows.slice(page * ROW_PER_PAGE, (page + 1) * ROW_PER_PAGE)
 
-  // ══════════════════════════════════════════════════════════
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', overflow: 'hidden' }}>
-
-      {/* ── TOPBAR ──────────────────────────────────────── */}
       <header style={{
-        height: 52, flexShrink: 0, display: 'flex', alignItems: 'center',
-        padding: '0 24px', gap: 16,
-        background: 'var(--surface)', borderBottom: '1px solid var(--border)',
+        height: 52,
+        flexShrink: 0,
+        display: 'flex',
+        alignItems: 'center',
+        padding: '0 24px',
+        gap: 16,
+        background: 'var(--surface)',
+        borderBottom: '1px solid var(--border)',
       }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, flex: 1 }}>
           <div style={{
-            width: 30, height: 30, borderRadius: 8, background: 'var(--amber)',
-            display: 'flex', alignItems: 'center', justifyContent: 'center',
-            fontWeight: 800, fontSize: 14, color: '#0f1117',
+            width: 30,
+            height: 30,
+            borderRadius: 8,
+            background: 'var(--amber)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            fontWeight: 800,
+            fontSize: 14,
+            color: '#0f1117',
           }}>M</div>
           <span style={{ fontWeight: 700, fontSize: 15 }}>Material Depot</span>
           <span style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--muted)' }}>/ PDF Miner</span>
@@ -230,92 +320,149 @@ export default function Workspace({ session }) {
         </button>
       </header>
 
-      {/* ── MAIN ────────────────────────────────────────── */}
       <div style={{ flex: 1, overflow: 'auto', padding: 28 }}>
-        <div style={{ maxWidth: 1100, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 24 }}>
-
-          {/* ── UPLOAD CARD ─────────────────────────────── */}
-          <div style={{
-            background: 'var(--surface)', border: '1px solid var(--border)',
-            borderRadius: 16, padding: 28,
-          }}>
+        <div style={{ maxWidth: 1180, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 24 }}>
+          <div style={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 16, padding: 28 }}>
             <div style={{ fontWeight: 700, fontSize: 18, marginBottom: 20 }}>Extract Product Data from PDF</div>
 
             <div style={{ display: 'flex', gap: 20, flexWrap: 'wrap' }}>
-
-              {/* Drop zone */}
               <div
-                onDragOver={e => { e.preventDefault(); setDragging(true) }}
+                onDragOver={event => { event.preventDefault(); setDragging(true) }}
                 onDragLeave={() => setDragging(false)}
                 onDrop={onDrop}
-                onClick={() => !file && document.getElementById('pdf-inp').click()}
+                onClick={() => fileInputRef.current?.click()}
                 style={{
-                  flex: '1 1 300px', minHeight: 130,
-                  border: `2px dashed ${dragging ? 'var(--amber)' : file ? 'var(--green)' : 'var(--border)'}`,
-                  borderRadius: 12, background: dragging ? '#1e1a0a' : file ? '#0a1a12' : 'var(--bg)',
-                  display: 'flex', alignItems: 'center', justifyContent: 'center',
-                  cursor: file ? 'default' : 'pointer', transition: 'all 0.15s',
-                  padding: 20,
+                  flex: '2 1 560px',
+                  minHeight: 190,
+                  borderRadius: 18,
+                  border: `2px dashed ${dragging || file ? 'var(--green)' : 'var(--border)'}`,
+                  background: dragging || file ? 'rgba(16,185,129,0.12)' : 'var(--bg)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  padding: 24,
+                  cursor: 'pointer',
                 }}
               >
-                <input id="pdf-inp" type="file" accept=".pdf" style={{ display: 'none' }}
-                  onChange={e => { const f = e.target.files?.[0]; if (f) { setFile(f); setStep('idle'); setError('') } }} />
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="application/pdf"
+                  hidden
+                  onChange={event => {
+                    const selected = event.target.files?.[0]
+                    if (selected) {
+                      setFile(selected)
+                      setStep('idle')
+                      setError('')
+                    }
+                  }}
+                />
 
                 {file ? (
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 14, width: '100%' }}>
-                    <span style={{ fontSize: 32 }}>📄</span>
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ fontWeight: 600, fontSize: 14, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                        {file.name}
-                      </div>
-                      <div style={{ fontSize: 12, color: 'var(--muted)', fontFamily: 'var(--mono)', marginTop: 2 }}>
-                        {(file.size / 1024 / 1024).toFixed(2)} MB
+                  <div style={{ width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 14, minWidth: 0 }}>
+                      <div style={{ fontSize: 42 }}>📄</div>
+                      <div style={{ minWidth: 0 }}>
+                        <div style={{ fontWeight: 700, fontSize: 16, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{file.name}</div>
+                        <div style={{ color: 'var(--muted)', fontFamily: 'var(--mono)', fontSize: 13 }}>{(file.size / 1024 / 1024).toFixed(2)} MB</div>
                       </div>
                     </div>
-                    <span style={{ color: 'var(--green)', fontSize: 18 }}>✓</span>
-                    <button className="btn btn-ghost" onClick={e => { e.stopPropagation(); setFile(null); setStep('idle') }}
-                      style={{ fontSize: 18, padding: '4px 8px' }}>✕</button>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <span style={{ color: 'var(--green)', fontSize: 20 }}>✓</span>
+                      <button
+                        className="btn btn-ghost"
+                        onClick={event => {
+                          event.stopPropagation()
+                          setFile(null)
+                          setRows([])
+                          setCsvStr('')
+                          setStep('idle')
+                        }}
+                      >
+                        ✕
+                      </button>
+                    </div>
                   </div>
                 ) : (
                   <div style={{ textAlign: 'center' }}>
                     <div style={{ fontSize: 36, marginBottom: 10 }}>📄</div>
                     <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 6 }}>Drop PDF here or click to browse</div>
-                    <div style={{ fontSize: 12, color: 'var(--muted)' }}>Building materials catalogues only</div>
+                    <div style={{ fontSize: 12, color: 'var(--muted)' }}>Image-based catalogues are supported now, not just text PDFs.</div>
                   </div>
                 )}
               </div>
 
-              {/* Category + controls */}
-              <div style={{ flex: '1 1 260px', display: 'flex', flexDirection: 'column', gap: 16 }}>
-
+              <div style={{ flex: '1 1 320px', display: 'flex', flexDirection: 'column', gap: 16 }}>
                 <div>
                   <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--muted)', marginBottom: 10, letterSpacing: '0.04em' }}>
                     PRODUCT CATEGORY
                   </div>
                   <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-                    {categories.map(c => {
-                      const color = CAT_COLORS[c.name] || 'var(--amber)'
-                      const sel   = categoryId === c.id
+                    {categories.map(category => {
+                      const color = CAT_COLORS[category.name] || 'var(--amber)'
+                      const selected = !customCategoryMode && categoryId === category.id
                       return (
-                        <button key={c.id} onClick={() => { setCategoryId(c.id); setCatName(c.name) }}
+                        <button
+                          key={category.id}
+                          onClick={() => {
+                            setCustomCategoryMode(false)
+                            setCustomCategoryName('')
+                            setCategoryId(category.id)
+                            setCategoryName(category.name)
+                          }}
                           style={{
-                            padding: '7px 14px', borderRadius: 8, border: `1px solid ${sel ? color : 'var(--border)'}`,
-                            background: sel ? color + '22' : 'transparent',
-                            color: sel ? color : 'var(--muted)',
-                            fontWeight: 600, fontSize: 13, textTransform: 'capitalize',
-                            cursor: 'pointer', transition: 'all 0.12s',
-                          }}>
-                          {c.name}
+                            padding: '7px 14px',
+                            borderRadius: 8,
+                            border: `1px solid ${selected ? color : 'var(--border)'}`,
+                            background: selected ? `${color}22` : 'transparent',
+                            color: selected ? color : 'var(--muted)',
+                            fontWeight: 600,
+                            fontSize: 13,
+                            textTransform: 'capitalize',
+                            cursor: 'pointer',
+                          }}
+                        >
+                          {category.name}
                         </button>
                       )
                     })}
+
+                    <button
+                      onClick={() => {
+                        setCustomCategoryMode(true)
+                        setCategoryId('')
+                        setCategoryName('')
+                      }}
+                      style={{
+                        padding: '7px 14px',
+                        borderRadius: 8,
+                        border: `1px solid ${customCategoryMode ? CAT_COLORS.custom : 'var(--border)'}`,
+                        background: customCategoryMode ? `${CAT_COLORS.custom}22` : 'transparent',
+                        color: customCategoryMode ? CAT_COLORS.custom : 'var(--muted)',
+                        fontWeight: 600,
+                        fontSize: 13,
+                        cursor: 'pointer',
+                      }}
+                    >
+                      Custom category
+                    </button>
                   </div>
                 </div>
+
+                {customCategoryMode && (
+                  <input
+                    className="inp"
+                    placeholder="Write your own category"
+                    value={customCategoryName}
+                    onChange={event => setCustomCategoryName(event.target.value)}
+                  />
+                )}
 
                 <button
                   className="btn btn-primary"
                   onClick={runExtraction}
-                  disabled={!file || !categoryId || step === 'processing'}
+                  disabled={!canRun}
                   style={{ padding: '13px 24px', fontSize: 15, fontWeight: 700, marginTop: 'auto' }}
                 >
                   {step === 'processing'
@@ -326,81 +473,57 @@ export default function Workspace({ session }) {
               </div>
             </div>
 
-            {/* Status / error bar */}
             {(step === 'processing' || step === 'error' || step === 'done') && (
               <div style={{
-                marginTop: 18, padding: '12px 16px', borderRadius: 10,
+                marginTop: 18,
+                padding: '12px 16px',
+                borderRadius: 10,
                 background: step === 'error' ? '#2d0a0a' : step === 'done' ? '#0a1a0f' : 'var(--bg)',
                 border: `1px solid ${step === 'error' ? '#7f1d1d' : step === 'done' ? '#14532d' : 'var(--border)'}`,
-                display: 'flex', alignItems: 'center', gap: 10,
-                fontFamily: 'var(--mono)', fontSize: 13,
+                display: 'flex',
+                alignItems: 'center',
+                gap: 10,
+                fontFamily: 'var(--mono)',
+                fontSize: 13,
                 color: step === 'error' ? 'var(--red)' : step === 'done' ? 'var(--green)' : 'var(--amber)',
               }}>
-                {step === 'processing' && (
-                  <span className="spin" style={{ width: 14, height: 14, border: '2px solid var(--border)', borderTopColor: 'var(--amber)', borderRadius: '50%', flexShrink: 0, display: 'inline-block' }} />
-                )}
-                {step === 'error'  && '✗ '}
-                {step === 'done'   && '✓ '}
+                {step === 'processing' && <span className="spin" style={{ width: 14, height: 14, border: '2px solid var(--border)', borderTopColor: 'var(--amber)', borderRadius: '50%', display: 'inline-block' }} />}
+                {step === 'error' && '✗ '}
+                {step === 'done' && '✓ '}
                 {step === 'error' ? error : statusMsg}
               </div>
             )}
           </div>
 
-          {/* ── RESULTS TABLE ───────────────────────────── */}
           {step === 'done' && rows.length > 0 && (
             <div style={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 16, overflow: 'hidden' }}>
-
-              {/* Table header */}
-              <div style={{
-                display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-                padding: '18px 24px', borderBottom: '1px solid var(--border)',
-              }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '18px 24px', borderBottom: '1px solid var(--border)' }}>
                 <div>
                   <div style={{ fontWeight: 700, fontSize: 16 }}>{rows.length} products extracted</div>
-                  <div style={{ fontSize: 12, color: 'var(--muted)', marginTop: 2 }}>
-                    from {file?.name} · {categoryName}
-                  </div>
+                  <div style={{ fontSize: 12, color: 'var(--muted)', marginTop: 2 }}>from {file?.name} · {activeCategoryName}</div>
                 </div>
-                <button
-                  className="btn btn-primary"
-                  onClick={() => downloadCsv(csvStr, `${file.name.replace('.pdf', '')}_${categoryName}.csv`)}
-                >
+                <button className="btn btn-primary" onClick={() => downloadCsv(csvStr, `${file.name.replace('.pdf', '')}_${activeCategoryName}.csv`)}>
                   ↓ Download CSV
                 </button>
               </div>
 
-              {/* Table */}
               <div style={{ overflowX: 'auto' }}>
                 <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
                   <thead>
                     <tr style={{ background: 'var(--bg)' }}>
-                      {columns.map(col => (
-                        <th key={col} style={{
-                          padding: '10px 16px', textAlign: 'left', fontWeight: 600,
-                          fontSize: 11, letterSpacing: '0.05em', color: 'var(--muted)',
-                          textTransform: 'uppercase', whiteSpace: 'nowrap',
-                          borderBottom: '1px solid var(--border)',
-                        }}>
-                          {col.replace(/_/g, ' ')}
+                      {columns.map(column => (
+                        <th key={column} style={{ padding: '10px 16px', textAlign: 'left', fontWeight: 600, fontSize: 11, letterSpacing: '0.05em', color: 'var(--muted)', textTransform: 'uppercase', whiteSpace: 'nowrap', borderBottom: '1px solid var(--border)' }}>
+                          {column.replace(/_/g, ' ')}
                         </th>
                       ))}
                     </tr>
                   </thead>
                   <tbody>
-                    {pageRows.map((row, i) => (
-                      <tr key={i} style={{ borderBottom: '1px solid var(--border)' }}
-                        onMouseEnter={e => e.currentTarget.style.background = 'var(--bg)'}
-                        onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
-                      >
-                        {columns.map(col => (
-                          <td key={col} style={{
-                            padding: '10px 16px', color: col === 'product_code' ? 'var(--amber)' : 'var(--text)',
-                            fontFamily: col === 'product_code' ? 'var(--mono)' : 'inherit',
-                            fontWeight: col === 'product_code' ? 600 : 400,
-                            whiteSpace: 'nowrap', maxWidth: 220,
-                            overflow: 'hidden', textOverflow: 'ellipsis',
-                          }}>
-                            {row[col] || <span style={{ color: 'var(--border)' }}>—</span>}
+                    {pageRows.map((row, index) => (
+                      <tr key={`${row.sku || 'row'}-${index}`} style={{ borderBottom: '1px solid var(--border)' }}>
+                        {columns.map(column => (
+                          <td key={column} style={{ padding: '10px 16px', whiteSpace: 'nowrap', maxWidth: 240, overflow: 'hidden', textOverflow: 'ellipsis', color: column === 'sku' ? 'var(--amber)' : 'var(--text)', fontFamily: column === 'sku' ? 'var(--mono)' : 'inherit', fontWeight: column === 'sku' ? 600 : 400 }}>
+                            {row[column] || <span style={{ color: 'var(--border)' }}>—</span>}
                           </td>
                         ))}
                       </tr>
@@ -409,41 +532,33 @@ export default function Workspace({ session }) {
                 </table>
               </div>
 
-              {/* Pagination */}
               {totalPages > 1 && (
-                <div style={{
-                  display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-                  padding: '14px 24px', borderTop: '1px solid var(--border)',
-                }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '14px 24px', borderTop: '1px solid var(--border)' }}>
                   <span style={{ fontSize: 13, color: 'var(--muted)' }}>
                     Showing {page * ROW_PER_PAGE + 1}–{Math.min((page + 1) * ROW_PER_PAGE, rows.length)} of {rows.length}
                   </span>
                   <div style={{ display: 'flex', gap: 8 }}>
-                    <button className="btn btn-outline" onClick={() => setPage(p => Math.max(0, p - 1))}
-                      disabled={page === 0} style={{ padding: '6px 14px', fontSize: 13 }}>← Prev</button>
-                    <button className="btn btn-outline" onClick={() => setPage(p => Math.min(totalPages - 1, p + 1))}
-                      disabled={page === totalPages - 1} style={{ padding: '6px 14px', fontSize: 13 }}>Next →</button>
+                    <button className="btn btn-outline" onClick={() => setPage(value => Math.max(0, value - 1))} disabled={page === 0} style={{ padding: '6px 14px', fontSize: 13 }}>← Prev</button>
+                    <button className="btn btn-outline" onClick={() => setPage(value => Math.min(totalPages - 1, value + 1))} disabled={page === totalPages - 1} style={{ padding: '6px 14px', fontSize: 13 }}>Next →</button>
                   </div>
                 </div>
               )}
             </div>
           )}
 
-          {/* ── HISTORY ─────────────────────────────────── */}
           {history.length > 0 && (
             <div style={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 16, overflow: 'hidden' }}>
-              <div style={{ padding: '18px 24px', borderBottom: '1px solid var(--border)', fontWeight: 700, fontSize: 15 }}>
-                Recent Extractions
+              <div style={{ padding: '18px 24px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                <div style={{ fontWeight: 700, fontSize: 15 }}>Recent Extractions</div>
+                <div style={{ fontSize: 12, color: 'var(--muted)' }}>Auto-cleaned every 24 hours</div>
               </div>
               <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
                 <thead>
                   <tr style={{ background: 'var(--bg)' }}>
-                    {['PDF', 'Category', 'Products', 'Date', 'CSV'].map(h => (
-                      <th key={h} style={{
-                        padding: '10px 20px', textAlign: 'left', fontWeight: 600,
-                        fontSize: 11, color: 'var(--muted)', textTransform: 'uppercase',
-                        letterSpacing: '0.04em', borderBottom: '1px solid var(--border)',
-                      }}>{h}</th>
+                    {['PDF', 'Category', 'Products', 'Date', 'CSV'].map(header => (
+                      <th key={header} style={{ padding: '10px 20px', textAlign: 'left', fontWeight: 600, fontSize: 11, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '0.04em', borderBottom: '1px solid var(--border)' }}>
+                        {header}
+                      </th>
                     ))}
                   </tr>
                 </thead>
@@ -453,24 +568,23 @@ export default function Workspace({ session }) {
                       <td style={{ padding: '12px 20px', fontFamily: 'var(--mono)', fontSize: 12 }}>{job.pdf_name}</td>
                       <td style={{ padding: '12px 20px' }}>
                         <span style={{
-                          padding: '3px 10px', borderRadius: 6, fontSize: 12, fontWeight: 600,
-                          background: (CAT_COLORS[job.category_name] || 'var(--amber)') + '22',
+                          padding: '3px 10px',
+                          borderRadius: 6,
+                          fontSize: 12,
+                          fontWeight: 600,
+                          background: `${CAT_COLORS[job.category_name] || 'var(--amber)'}22`,
                           color: CAT_COLORS[job.category_name] || 'var(--amber)',
                           textTransform: 'capitalize',
-                        }}>{job.category_name || '—'}</span>
+                        }}>
+                          {job.category_name || '—'}
+                        </span>
                       </td>
-                      <td style={{ padding: '12px 20px', color: 'var(--amber)', fontWeight: 600 }}>
-                        {job.row_count || 0}
-                      </td>
-                      <td style={{ padding: '12px 20px', color: 'var(--muted)', fontSize: 12, fontFamily: 'var(--mono)' }}>
-                        {new Date(job.created_at).toLocaleDateString()}
-                      </td>
+                      <td style={{ padding: '12px 20px', color: 'var(--amber)', fontWeight: 600 }}>{job.row_count || 0}</td>
+                      <td style={{ padding: '12px 20px', color: 'var(--muted)', fontSize: 12, fontFamily: 'var(--mono)' }}>{new Date(job.created_at).toLocaleDateString()}</td>
                       <td style={{ padding: '12px 20px' }}>
-                        {job.csv_output ? (
-                          <button className="btn btn-outline"
-                            onClick={() => downloadCsv(job.csv_output, `${job.pdf_name.replace('.pdf', '')}.csv`)}
-                            style={{ padding: '5px 12px', fontSize: 12 }}>↓ CSV</button>
-                        ) : <span style={{ color: 'var(--muted)' }}>—</span>}
+                        {job.csv_output
+                          ? <button className="btn btn-outline" onClick={() => downloadCsv(job.csv_output, `${job.pdf_name.replace('.pdf', '')}.csv`)} style={{ padding: '5px 12px', fontSize: 12 }}>↓ CSV</button>
+                          : <span style={{ color: 'var(--muted)' }}>—</span>}
                       </td>
                     </tr>
                   ))}
@@ -478,7 +592,6 @@ export default function Workspace({ session }) {
               </table>
             </div>
           )}
-
         </div>
       </div>
     </div>
