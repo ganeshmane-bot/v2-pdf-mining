@@ -1,10 +1,21 @@
-import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Link } from 'react-router-dom'
 import { supabase } from '../lib/supabase.js'
 
 const PDFJS = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js'
 const WORKER = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'
 const ONE_MINUTE = 60 * 1000
 const CHUNK_SIZE = 4
+
+const CAT_COLORS = {
+  tiles: '#f59e0b',
+  laminates: '#10b981',
+  panels: '#3b82f6',
+  louvers: '#8b5cf6',
+  wallpapers: '#ec4899',
+  quartz: '#f97316',
+  custom: '#94a3b8',
+}
 
 async function loadPdfJs() {
   if (window.pdfjsLib) return window.pdfjsLib
@@ -39,7 +50,7 @@ async function renderPageToDataUrl(page, maxWidth = 1100, quality = 0.68) {
   return dataUrl
 }
 
-async function extractPdfPages(file, onProgress) {
+async function extractPdfPages(file, onProgress, shouldStop) {
   const pdfjs = await loadPdfJs()
   const buffer = await file.arrayBuffer()
   const pdfDoc = await pdfjs.getDocument({ data: buffer }).promise
@@ -47,6 +58,8 @@ async function extractPdfPages(file, onProgress) {
   const pages = []
 
   for (let i = 1; i <= total; i++) {
+    if (shouldStop?.()) throw new Error('Extraction stopped by user.')
+
     const page = await pdfDoc.getPage(i)
     const content = await page.getTextContent()
     const text = content.items.map(item => item.str).join(' ').replace(/\s+/g, ' ').trim()
@@ -99,28 +112,26 @@ function downloadCsv(csv, filename) {
   URL.revokeObjectURL(url)
 }
 
-const CAT_COLORS = {
-  tiles: '#f59e0b',
-  laminates: '#10b981',
-  panels: '#3b82f6',
-  louvers: '#8b5cf6',
-  wallpapers: '#ec4899',
-  quartz: '#f97316',
-  custom: '#94a3b8',
+function normalizeName(value) {
+  return String(value || '').trim().toLowerCase().replace(/\s+/g, ' ')
 }
 
 export default function Workspace({ session }) {
   const fileInputRef = useRef(null)
+  const abortRef = useRef(null)
+  const stopRequestedRef = useRef(false)
 
   const [categories, setCategories] = useState([])
   const [history, setHistory] = useState([])
   const [file, setFile] = useState(null)
+
   const [categoryId, setCategoryId] = useState('')
   const [categoryName, setCategoryName] = useState('')
   const [customCategoryMode, setCustomCategoryMode] = useState(false)
   const [customCategoryName, setCustomCategoryName] = useState('')
-  const [dragging, setDragging] = useState(false)
+  const [subcategory, setSubcategory] = useState('')
 
+  const [dragging, setDragging] = useState(false)
   const [step, setStep] = useState('idle')
   const [statusMsg, setStatusMsg] = useState('')
   const [rows, setRows] = useState([])
@@ -129,13 +140,18 @@ export default function Workspace({ session }) {
   const [error, setError] = useState('')
   const [page, setPage] = useState(0)
 
+  const [rating, setRating] = useState(0)
+  const [ratingNotes, setRatingNotes] = useState('')
+  const [ratingSaved, setRatingSaved] = useState(false)
+  const [ratingError, setRatingError] = useState('')
+
   const ROW_PER_PAGE = 20
   const email = session?.user?.email || ''
   const initials = email.split('@')[0].slice(0, 2).toUpperCase()
 
   const activeCategoryName = useMemo(() => {
     const value = customCategoryMode ? customCategoryName : categoryName
-    return String(value || '').trim().toLowerCase().replace(/\s+/g, ' ')
+    return normalizeName(value)
   }, [customCategoryMode, customCategoryName, categoryName])
 
   const canRun = Boolean(file) && Boolean(activeCategoryName) && step !== 'processing'
@@ -167,19 +183,47 @@ export default function Workspace({ session }) {
       setFile(dropped)
       setStep('idle')
       setError('')
+      setRows([])
+      setCsvStr('')
+      setRating(0)
+      setRatingNotes('')
+      setRatingSaved(false)
     } else {
       setError('Please upload a PDF file only.')
     }
   }, [])
 
+  async function stopExtraction() {
+    stopRequestedRef.current = true
+    abortRef.current?.abort()
+
+    if (jobId) {
+      await fetch('/api/jobs/fail', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ job_id: jobId, status: 'cancelled', error: 'Stopped by user' }),
+      }).catch(() => {})
+    }
+
+    setStep('idle')
+    setStatusMsg('Extraction stopped.')
+    loadHistory()
+  }
+
   async function runExtraction() {
     if (!canRun) return
 
+    stopRequestedRef.current = false
     setStep('processing')
     setError('')
     setRows([])
     setCsvStr('')
     setPage(0)
+    setRating(0)
+    setRatingNotes('')
+    setRatingSaved(false)
+    setRatingError('')
+    setJobId(null)
 
     try {
       setStatusMsg('Creating extraction job…')
@@ -193,6 +237,7 @@ export default function Workspace({ session }) {
             pdf_name: file.name,
             category_id: customCategoryMode ? null : categoryId,
             custom_category_name: customCategoryMode ? customCategoryName : '',
+            subcategory,
           }),
         })
 
@@ -207,25 +252,36 @@ export default function Workspace({ session }) {
       } catch {}
 
       setStatusMsg('Reading PDF pages, images, and embedded text…')
-      const { pages } = await extractPdfPages(file, (current, total) => {
-        setStatusMsg(`Preparing page ${current} of ${total}…`)
-      })
+      const { pages } = await extractPdfPages(
+        file,
+        (current, total) => setStatusMsg(`Preparing page ${current} of ${total}…`),
+        () => stopRequestedRef.current
+      )
+
+      if (stopRequestedRef.current) throw new Error('Extraction stopped by user.')
 
       let memory = {}
       const extracted = []
       const totalChunks = Math.ceil(pages.length / CHUNK_SIZE)
 
       for (let start = 0; start < pages.length; start += CHUNK_SIZE) {
+        if (stopRequestedRef.current) throw new Error('Extraction stopped by user.')
+
         const chunk = pages.slice(start, start + CHUNK_SIZE)
         const batchNo = Math.floor(start / CHUNK_SIZE) + 1
 
         setStatusMsg(`AI analyzing pages ${chunk[0].page_no}-${chunk[chunk.length - 1].page_no} (batch ${batchNo}/${totalChunks})…`)
 
+        const controller = new AbortController()
+        abortRef.current = controller
+
         const extractRes = await fetch('/api/extract', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
+          signal: controller.signal,
           body: JSON.stringify({
             category: activeCategoryName,
+            subcategory,
             pages: chunk,
             memory,
           }),
@@ -247,8 +303,10 @@ export default function Workspace({ session }) {
         if (Array.isArray(extractData.products)) extracted.push(...extractData.products)
       }
 
+      abortRef.current = null
+
       if (!extracted.length) {
-        throw new Error('No products found — now the extractor checks image pages too, so this PDF likely has no usable product pages or the prompt rules still need one more tuning pass for this layout.')
+        throw new Error('No products found — add a training example for this catalog layout if needed.')
       }
 
       extracted.sort((a, b) => {
@@ -274,8 +332,56 @@ export default function Workspace({ session }) {
       setStatusMsg(`Done — ${extracted.length} products extracted`)
       loadHistory()
     } catch (err) {
-      setError(String(err?.message || err))
+      const message = String(err?.message || err)
+
+      if (stopRequestedRef.current || message.includes('aborted') || message.includes('stopped by user')) {
+        setStep('idle')
+        setStatusMsg('Extraction stopped.')
+        return
+      }
+
+      setError(message)
       setStep('error')
+
+      if (jobId) {
+        await fetch('/api/jobs/fail', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ job_id: jobId, status: 'failed', error: message }),
+        }).catch(() => {})
+      }
+    } finally {
+      abortRef.current = null
+    }
+  }
+
+  async function submitRating() {
+    if (!rows.length || !activeCategoryName || !rating) {
+      setRatingError('Choose a rating first.')
+      return
+    }
+
+    setRatingError('')
+
+    try {
+      const r = await fetch('/api/training/rate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          job_id: jobId,
+          category_name: activeCategoryName,
+          subcategory,
+          rating,
+          notes: ratingNotes,
+        }),
+      })
+
+      const data = await r.json().catch(() => ({}))
+      if (!r.ok) throw new Error(data.error || 'Could not save rating')
+
+      setRatingSaved(true)
+    } catch (err) {
+      setRatingError(String(err?.message || err))
     }
   }
 
@@ -315,6 +421,12 @@ export default function Workspace({ session }) {
           <span style={{ fontWeight: 700, fontSize: 15 }}>Material Depot</span>
           <span style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--muted)' }}>/ PDF Miner</span>
         </div>
+
+        <div style={{ display: 'flex', gap: 8 }}>
+          <Link className="btn btn-ghost" to="/" style={{ color: 'var(--text)' }}>Workspace</Link>
+          <Link className="btn btn-ghost" to="/training">Training</Link>
+        </div>
+
         <button className="btn btn-ghost" onClick={logout} style={{ fontSize: 13 }}>
           {initials} · {email.split('@')[0]} · Sign out
         </button>
@@ -388,7 +500,7 @@ export default function Workspace({ session }) {
                   <div style={{ textAlign: 'center' }}>
                     <div style={{ fontSize: 36, marginBottom: 10 }}>📄</div>
                     <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 6 }}>Drop PDF here or click to browse</div>
-                    <div style={{ fontSize: 12, color: 'var(--muted)' }}>Image-based catalogues are supported now, not just text PDFs.</div>
+                    <div style={{ fontSize: 12, color: 'var(--muted)' }}>Image-based catalogues and text PDFs are both supported.</div>
                   </div>
                 )}
               </div>
@@ -459,21 +571,36 @@ export default function Workspace({ session }) {
                   />
                 )}
 
-                <button
-                  className="btn btn-primary"
-                  onClick={runExtraction}
-                  disabled={!canRun}
-                  style={{ padding: '13px 24px', fontSize: 15, fontWeight: 700, marginTop: 'auto' }}
-                >
-                  {step === 'processing'
-                    ? <><span className="spin" style={{ width: 16, height: 16, border: '2px solid rgba(0,0,0,0.3)', borderTopColor: '#0f1117', borderRadius: '50%', display: 'inline-block' }} /> Extracting…</>
-                    : '⚡ Extract Data'
-                  }
-                </button>
+                <input
+                  className="inp"
+                  placeholder="Optional subcategory"
+                  value={subcategory}
+                  onChange={event => setSubcategory(event.target.value)}
+                />
+
+                <div style={{ display: 'flex', gap: 10, marginTop: 'auto' }}>
+                  <button
+                    className="btn btn-primary"
+                    onClick={runExtraction}
+                    disabled={!canRun}
+                    style={{ flex: 1, padding: '13px 24px', fontSize: 15, fontWeight: 700 }}
+                  >
+                    {step === 'processing'
+                      ? <><span className="spin" style={{ width: 16, height: 16, border: '2px solid rgba(0,0,0,0.3)', borderTopColor: '#0f1117', borderRadius: '50%', display: 'inline-block' }} /> Extracting…</>
+                      : '⚡ Extract Data'
+                    }
+                  </button>
+
+                  {step === 'processing' && (
+                    <button className="btn btn-outline" onClick={stopExtraction} style={{ padding: '13px 18px', fontWeight: 700 }}>
+                      Stop
+                    </button>
+                  )}
+                </div>
               </div>
             </div>
 
-            {(step === 'processing' || step === 'error' || step === 'done') && (
+            {(step === 'processing' || step === 'error' || step === 'done' || statusMsg) && (
               <div style={{
                 marginTop: 18,
                 padding: '12px 16px',
@@ -500,11 +627,50 @@ export default function Workspace({ session }) {
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '18px 24px', borderBottom: '1px solid var(--border)' }}>
                 <div>
                   <div style={{ fontWeight: 700, fontSize: 16 }}>{rows.length} products extracted</div>
-                  <div style={{ fontSize: 12, color: 'var(--muted)', marginTop: 2 }}>from {file?.name} · {activeCategoryName}</div>
+                  <div style={{ fontSize: 12, color: 'var(--muted)', marginTop: 2 }}>
+                    from {file?.name} · {activeCategoryName}{subcategory ? ` · ${normalizeName(subcategory)}` : ''}
+                  </div>
                 </div>
                 <button className="btn btn-primary" onClick={() => downloadCsv(csvStr, `${file.name.replace('.pdf', '')}_${activeCategoryName}.csv`)}>
                   ↓ Download CSV
                 </button>
+              </div>
+
+              <div style={{ padding: '16px 24px', borderBottom: '1px solid var(--border)', background: 'var(--bg)' }}>
+                <div style={{ fontWeight: 700, marginBottom: 10 }}>Rate this extraction</div>
+                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 10 }}>
+                  {[1, 2, 3, 4, 5].map(value => (
+                    <button
+                      key={value}
+                      className="btn btn-outline"
+                      onClick={() => setRating(value)}
+                      style={{
+                        padding: '8px 12px',
+                        borderColor: rating === value ? 'var(--amber)' : 'var(--border)',
+                        color: rating === value ? 'var(--amber)' : 'var(--text)',
+                      }}
+                    >
+                      {'★'.repeat(value)}
+                    </button>
+                  ))}
+                </div>
+
+                <textarea
+                  className="inp"
+                  rows={3}
+                  placeholder="Optional note. Example: missed flooring size on pages without printed code, or got the color family wrong."
+                  value={ratingNotes}
+                  onChange={e => setRatingNotes(e.target.value)}
+                  style={{ resize: 'vertical', marginBottom: 10 }}
+                />
+
+                <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                  <button className="btn btn-primary" onClick={submitRating} disabled={ratingSaved || !rating}>
+                    {ratingSaved ? 'Rating saved' : 'Save rating'}
+                  </button>
+                  <Link className="btn btn-outline" to="/training">Open Training Page</Link>
+                  {ratingError ? <span style={{ color: 'var(--red)', fontSize: 13 }}>{ratingError}</span> : null}
+                </div>
               </div>
 
               <div style={{ overflowX: 'auto' }}>
@@ -522,7 +688,7 @@ export default function Workspace({ session }) {
                     {pageRows.map((row, index) => (
                       <tr key={`${row.sku || 'row'}-${index}`} style={{ borderBottom: '1px solid var(--border)' }}>
                         {columns.map(column => (
-                          <td key={column} style={{ padding: '10px 16px', whiteSpace: 'nowrap', maxWidth: 240, overflow: 'hidden', textOverflow: 'ellipsis', color: column === 'sku' ? 'var(--amber)' : 'var(--text)', fontFamily: column === 'sku' ? 'var(--mono)' : 'inherit', fontWeight: column === 'sku' ? 600 : 400 }}>
+                          <td key={column} style={{ padding: '10px 16px', whiteSpace: 'nowrap', maxWidth: 260, overflow: 'hidden', textOverflow: 'ellipsis', color: column === 'sku' ? 'var(--amber)' : 'var(--text)', fontFamily: column === 'sku' ? 'var(--mono)' : 'inherit', fontWeight: column === 'sku' ? 600 : 400 }}>
                             {row[column] || <span style={{ color: 'var(--border)' }}>—</span>}
                           </td>
                         ))}
@@ -550,8 +716,9 @@ export default function Workspace({ session }) {
             <div style={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 16, overflow: 'hidden' }}>
               <div style={{ padding: '18px 24px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                 <div style={{ fontWeight: 700, fontSize: 15 }}>Recent Extractions</div>
-                <div style={{ fontSize: 12, color: 'var(--muted)' }}>Auto-cleaned every 24 hours</div>
+                <div style={{ fontSize: 12, color: 'var(--muted)' }}>Last 24 hours</div>
               </div>
+
               <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
                 <thead>
                   <tr style={{ background: 'var(--bg)' }}>
@@ -578,6 +745,7 @@ export default function Workspace({ session }) {
                         }}>
                           {job.category_name || '—'}
                         </span>
+                        {job.subcategory ? <span style={{ marginLeft: 8, color: 'var(--muted)', fontSize: 12 }}>{job.subcategory}</span> : null}
                       </td>
                       <td style={{ padding: '12px 20px', color: 'var(--amber)', fontWeight: 600 }}>{job.row_count || 0}</td>
                       <td style={{ padding: '12px 20px', color: 'var(--muted)', fontSize: 12, fontFamily: 'var(--mono)' }}>{new Date(job.created_at).toLocaleDateString()}</td>
