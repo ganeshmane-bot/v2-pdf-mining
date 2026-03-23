@@ -1,8 +1,9 @@
 import { useState, useEffect } from 'react'
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { supabase } from './lib/supabase.js'
-import Login     from './pages/Login.jsx'
+import Login from './pages/Login.jsx'
 import Workspace from './pages/Workspace.jsx'
+import Training from './pages/Training.jsx'
 
 export default function App() {
   const [session, setSession] = useState(undefined)
@@ -25,7 +26,9 @@ export default function App() {
     <BrowserRouter>
       <Routes>
         <Route path="/login" element={!session ? <Login /> : <Navigate to="/" />} />
-        <Route path="/*"     element={ session ? <Workspace session={session} /> : <Navigate to="/login" />} />
+        <Route path="/" element={session ? <Workspace session={session} /> : <Navigate to="/login" />} />
+        <Route path="/training" element={session ? <Training session={session} /> : <Navigate to="/login" />} />
+        <Route path="*" element={<Navigate to="/" />} />
       </Routes>
     </BrowserRouter>
   )
