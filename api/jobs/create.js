@@ -1,7 +1,13 @@
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).end()
 
-  const { pdf_name, category_id, custom_category_name } = req.body || {}
+  const {
+    pdf_name,
+    category_id,
+    custom_category_name = '',
+    subcategory = '',
+  } = req.body || {}
+
   if (!pdf_name) return res.status(400).json({ error: 'Missing pdf_name' })
 
   const SB_URL = process.env.VITE_SUPABASE_URL
@@ -14,7 +20,6 @@ export default async function handler(req, res) {
   const normalizeName = value => String(value || '').trim().toLowerCase().replace(/\s+/g, ' ')
 
   let finalCategoryId = category_id || null
-  let finalCategoryName = ''
 
   try {
     const customName = normalizeName(custom_category_name)
@@ -42,7 +47,6 @@ export default async function handler(req, res) {
 
       const category = Array.isArray(categoryData) ? categoryData[0] : categoryData
       finalCategoryId = category?.id
-      finalCategoryName = category?.name || customName
     }
 
     const jobRes = await fetch(`${SB_URL}/rest/v1/jobs`, {
@@ -56,6 +60,7 @@ export default async function handler(req, res) {
       body: JSON.stringify({
         pdf_name,
         category_id: finalCategoryId,
+        subcategory: normalizeName(subcategory),
         status: 'processing',
       }),
     })
@@ -66,11 +71,7 @@ export default async function handler(req, res) {
     }
 
     const job = Array.isArray(jobData) ? jobData[0] : jobData
-    return res.status(200).json({
-      job_id: job.id,
-      category_id: finalCategoryId,
-      category_name: finalCategoryName,
-    })
+    return res.status(200).json({ job_id: job.id, category_id: finalCategoryId })
   } catch (error) {
     return res.status(500).json({ error: String(error?.message || error) })
   }
