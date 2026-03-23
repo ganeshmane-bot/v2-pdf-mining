@@ -9,17 +9,12 @@ export default async function handler(req, res) {
   }
 
   const cutoff = new Date(Date.now() - ONE_DAY_MS).toISOString()
-  const authHeaders = { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}` }
+  const headers = { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}` }
 
   try {
-    await fetch(`${SB_URL}/rest/v1/jobs?created_at=lt.${encodeURIComponent(cutoff)}`, {
-      method: 'DELETE',
-      headers: authHeaders,
-    }).catch(() => {})
-
     const r = await fetch(
-      `${SB_URL}/rest/v1/jobs?select=id,pdf_name,status,row_count,csv_output,created_at,completed_at,categories(name)&created_at=gte.${encodeURIComponent(cutoff)}&order=created_at.desc&limit=100`,
-      { headers: authHeaders }
+      `${SB_URL}/rest/v1/jobs?select=id,pdf_name,status,row_count,csv_output,created_at,completed_at,subcategory,categories(name)&created_at=gte.${encodeURIComponent(cutoff)}&order=created_at.desc&limit=100`,
+      { headers }
     )
 
     const data = await r.json()
