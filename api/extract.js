@@ -104,12 +104,16 @@ const OUTPUT_SCHEMA = {
   },
 }
 
-function compactText(text = '', limit = 2400) {
-  return String(text || '').replace(/\s+/g, ' ').trim().slice(0, limit)
-}
-
 function normalizeText(value) {
   return String(value ?? '').replace(/\s+/g, ' ').trim()
+}
+
+function normalizeName(value) {
+  return normalizeText(value).toLowerCase().replace(/\s+/g, ' ')
+}
+
+function compactText(text = '', limit = 2500) {
+  return normalizeText(text).slice(0, limit)
 }
 
 function normalizePipe(value) {
@@ -140,10 +144,7 @@ function buildSize({ size, length_mm, width_mm, thickness_mm }) {
 }
 
 function slugPart(value, max = 8) {
-  return normalizeText(value)
-    .toUpperCase()
-    .replace(/[^A-Z0-9]+/g, '')
-    .slice(0, max)
+  return normalizeText(value).toUpperCase().replace(/[^A-Z0-9]+/g, '').slice(0, max)
 }
 
 function deriveSku(product) {
@@ -153,8 +154,8 @@ function deriveSku(product) {
   const fromName = slugPart(product.name, 8)
   const length = normalizeMm(product.length_mm)
   const width = normalizeMm(product.width_mm)
-  const sizeBits = `${length}${width}`.slice(0, 8)
   const pageBit = `P${String(product.page_no || '').padStart(2, '0')}`
+  const sizeBits = `${length}${width}`.slice(0, 8)
 
   if (fromName && sizeBits) return `${fromName}-${sizeBits}`.slice(0, 18)
   if (fromName) return `${fromName}-${pageBit}`.slice(0, 18)
@@ -171,18 +172,68 @@ function mergeMemory(base = EMPTY_MEMORY, update = EMPTY_MEMORY) {
   return merged
 }
 
-function normalizeMemory(memory = {}) {
-  return mergeMemory(EMPTY_MEMORY, memory)
+function pickRelevantRows(rows = [], subcategory = '') {
+  const wanted = normalizeName(subcategory)
+  const exact = []
+  const generic = []
+
+  for (const row of rows) {
+    const sub = normalizeName(row.subcategory)
+    if (wanted && sub === wanted) exact.push(row)
+    else if (!sub) generic.push(row)
+    else if (!wanted) exact.push(row)
+  }
+
+  return [...exact, ...generic]
 }
 
-function normalizeProduct(product = {}, memory = EMPTY_MEMORY, category = 'default') {
+async function fetchTrainingExamples({ SB_URL, SB_KEY, category, subcategory }) {
+  const r = await fetch(
+    `${SB_URL}/rest/v1/training_examples?select=id,category_name,subcategory,image_data_url,input_context,correction_text,expected_output,rating_score,usage_count,created_at&category_name=eq.${encodeURIComponent(normalizeName(category))}&order=rating_score.desc,created_at.desc&limit=8`,
+    { headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}` } }
+  )
+
+  const data = await r.json().catch(() => [])
+  return pickRelevantRows(Array.isArray(data) ? data : [], subcategory).slice(0, 4)
+}
+
+async function fetchFeedbackNotes({ SB_URL, SB_KEY, category, subcategory }) {
+  const r = await fetch(
+    `${SB_URL}/rest/v1/job_feedback?select=id,category_name,subcategory,rating,notes,created_at&category_name=eq.${encodeURIComponent(normalizeName(category))}&order=created_at.desc&limit=12`,
+    { headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}` } }
+  )
+
+  const data = await r.json().catch(() => [])
+  return pickRelevantRows(Array.isArray(data) ? data : [], subcategory)
+    .filter(item => normalizeText(item.notes))
+    .slice(0, 6)
+}
+
+function buildExampleText(example, index) {
+  return [
+    `TRAINING EXAMPLE ${index + 1}`,
+    `Category: ${normalizeText(example.category_name)}`,
+    `Subcategory: ${normalizeText(example.subcategory) || '[generic]'}`,
+    `Context: ${normalizeText(example.input_context) || '[none]'}`,
+    `Correction: ${normalizeText(example.correction_text)}`,
+    `Expected output: ${
+      example.expected_output
+        ? typeof example.expected_output === 'string'
+          ? example.expected_output
+          : JSON.stringify(example.expected_output)
+        : '[none]'
+    }`,
+  ].join('\n')
+}
+
+function normalizeProduct(product = {}, memory = EMPTY_MEMORY, category = 'default', subcategory = '') {
   const row = { ...product }
 
   row.page_no = Number(row.page_no || 0)
   row.category = normalizeText(row.category) || normalizeText(category)
   row.brand_name = normalizeText(row.brand_name) || memory.brand_name
   row.collection_name = normalizeText(row.collection_name) || memory.collection_name
-  row.subcategory = normalizeText(row.subcategory) || memory.subcategory
+  row.subcategory = normalizeText(row.subcategory) || normalizeText(subcategory) || memory.subcategory
   row.finish = normalizeText(row.finish) || memory.default_finish
   row.base_material = normalizeText(row.base_material) || memory.default_base_material
   row.special_features = normalizePipe(row.special_features) || memory.special_features_common
@@ -248,30 +299,55 @@ function normalizeProduct(product = {}, memory = EMPTY_MEMORY, category = 'defau
   }
 }
 
-function buildMessages(category, pages, memory) {
-  const intro = `You are extracting structured catalog data from a building-material PDF.
+function buildMessages(category, subcategory, pages, memory, trainingExamples, feedbackNotes) {
+  const content = [
+    {
+      type: 'text',
+      text: `You are extracting structured product data from a building-material PDF.
 
 You must inspect BOTH the page image and the extracted text.
 
 Critical rules:
-1. First classify every page internally as product_page, common_page, or ignore.
-2. Do NOT require a printed product code. If a page shows a named design, swatch, sample board, dimension callout, spec card, or obvious product visual, it can still produce a product row.
+1. Classify pages internally as product_page, common_page, or ignore.
+2. Do NOT require a printed product code. If a page shows a named design, swatch, sample board, size callout, spec card, finish card, or obvious product visual, it can still produce a product row.
 3. If SKU / product code is missing, create a very short stable SKU from the best visible identifiers in this order: printed code -> design name + size -> design name + page number.
 4. Extract visual fields from the product image itself: color, approximate dominant color hex, color_family, texture, look, pattern_type.
-5. Extract technical / marketing claims when visible, such as MR+, micro scratch resistance, application area, vertical/horizontal use, warranty, stain resistance, abrasion resistance, etc.
+5. Extract technical / marketing claims when visible, such as MR+, micro scratch resistance, application area, horizontal/vertical use, stain resistance, abrasion resistance, etc.
 6. Parse dimensions into length_mm, width_mm, thickness_mm whenever possible.
-7. special_features, application_area, and technical_data must be concise strings, using " | " separators when there are multiple points.
-8. If a page is only a common information page, do not invent products; instead update memory_update.
-9. Use the prior memory when a later product page omits shared details.
-10. Return strict JSON only.`
-
-  const content = [
-    { type: 'text', text: intro },
+7. Required business fields: sku, name, length_mm, width_mm, thickness_mm, subcategory, color, look.
+8. Use common pages to update memory_update instead of inventing products.
+9. Use prior memory and training examples when a later page omits shared details.
+10. Return strict JSON only.`,
+    },
     {
       type: 'text',
-      text: `CATEGORY: ${normalizeText(category)}\n\nPRIOR MEMORY:\n${JSON.stringify(normalizeMemory(memory), null, 2)}`,
+      text: `CATEGORY: ${normalizeText(category)}\nSUBCATEGORY: ${normalizeText(subcategory) || '[optional-empty]'}\n\nPRIOR MEMORY:\n${JSON.stringify(mergeMemory(EMPTY_MEMORY, memory), null, 2)}`,
     },
   ]
+
+  if (trainingExamples.length) {
+    content.push({
+      type: 'text',
+      text: `FOLLOW THESE USER TRAINING EXAMPLES CAREFULLY. They override weak guesses when the page layout matches.`,
+    })
+
+    trainingExamples.forEach((example, index) => {
+      content.push({ type: 'text', text: buildExampleText(example, index) })
+      if (example.image_data_url && index < 2) {
+        content.push({
+          type: 'image_url',
+          image_url: { url: example.image_data_url, detail: 'low' },
+        })
+      }
+    })
+  }
+
+  if (feedbackNotes.length) {
+    content.push({
+      type: 'text',
+      text: `RECENT USER RATING NOTES TO FOLLOW:\n${feedbackNotes.map(item => `- [${item.rating}/5] ${normalizeText(item.notes)}`).join('\n')}`,
+    })
+  }
 
   for (const page of pages) {
     content.push({
@@ -282,10 +358,7 @@ Critical rules:
     if (page.image_data_url) {
       content.push({
         type: 'image_url',
-        image_url: {
-          url: page.image_data_url,
-          detail: 'low',
-        },
+        image_url: { url: page.image_data_url, detail: 'low' },
       })
     }
   }
@@ -305,7 +378,7 @@ Critical rules:
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).end()
 
-  const { category = 'default', pages = [], memory = {} } = req.body || {}
+  const { category = 'default', subcategory = '', pages = [], memory = {} } = req.body || {}
   if (!Array.isArray(pages) || !pages.length) {
     return res.status(400).json({ error: 'No pages provided' })
   }
@@ -316,9 +389,19 @@ export default async function handler(req, res) {
 
   const apiKey = process.env.OPENAI_API_KEY
   const model = process.env.OPENAI_MODEL || 'gpt-4o-mini'
+  const SB_URL = process.env.VITE_SUPABASE_URL
+  const SB_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY
+
   if (!apiKey) return res.status(500).json({ error: 'OPENAI_API_KEY not set' })
 
   try {
+    const [trainingExamples, feedbackNotes] = SB_URL && SB_KEY
+      ? await Promise.all([
+          fetchTrainingExamples({ SB_URL, SB_KEY, category, subcategory }).catch(() => []),
+          fetchFeedbackNotes({ SB_URL, SB_KEY, category, subcategory }).catch(() => []),
+        ])
+      : [[], []]
+
     const aiRes = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -332,7 +415,7 @@ export default async function handler(req, res) {
           type: 'json_schema',
           json_schema: OUTPUT_SCHEMA,
         },
-        messages: buildMessages(category, pages, memory),
+        messages: buildMessages(category, subcategory, pages, memory, trainingExamples, feedbackNotes),
       }),
     })
 
@@ -366,13 +449,17 @@ export default async function handler(req, res) {
     }
 
     const mergedMemory = mergeMemory(memory, parsed.memory_update || {})
-    const products = (parsed.products || []).map(product => normalizeProduct(product, mergedMemory, category))
+    const products = (parsed.products || []).map(product =>
+      normalizeProduct(product, mergedMemory, category, subcategory)
+    )
 
     return res.status(200).json({
       products,
       count: products.length,
       page_analysis: parsed.page_analysis || [],
       memory: mergedMemory,
+      training_examples_used: trainingExamples.length,
+      feedback_notes_used: feedbackNotes.length,
     })
   } catch (error) {
     return res.status(500).json({ error: String(error?.message || error) })
