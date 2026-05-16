@@ -1,6 +1,6 @@
 // api/categories.js — no SDK, direct REST
 export default async function handler(req, res) {
-  const SB_URL = process.env.VITE_SUPABASE_URL
+  const SB_URL = process.env.NEXT_PUBLIC_SUPABASE_URL
   const SB_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY
 
   const r = await fetch(`${SB_URL}/rest/v1/categories?order=name`, {

@@ -10,8 +10,8 @@ export default async function handler(req, res) {
     return res.status(403).json({ error: 'Access restricted to MaterialDepot employees only.' })
   }
 
-  const SB_URL = process.env.VITE_SUPABASE_URL
-  const SB_KEY = process.env.VITE_SUPABASE_ANON_KEY
+  const SB_URL = process.env.NEXT_PUBLIC_SUPABASE_URL
+  const SB_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
 
   const r = await fetch(`${SB_URL}/auth/v1/token?grant_type=password`, {
     method:  'POST',

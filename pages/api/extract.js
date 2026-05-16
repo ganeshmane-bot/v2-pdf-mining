@@ -172,60 +172,6 @@ function mergeMemory(base = EMPTY_MEMORY, update = EMPTY_MEMORY) {
   return merged
 }
 
-function pickRelevantRows(rows = [], subcategory = '') {
-  const wanted = normalizeName(subcategory)
-  const exact = []
-  const generic = []
-
-  for (const row of rows) {
-    const sub = normalizeName(row.subcategory)
-    if (wanted && sub === wanted) exact.push(row)
-    else if (!sub) generic.push(row)
-    else if (!wanted) exact.push(row)
-  }
-
-  return [...exact, ...generic]
-}
-
-async function fetchTrainingExamples({ SB_URL, SB_KEY, category, subcategory }) {
-  const r = await fetch(
-    `${SB_URL}/rest/v1/training_examples?select=id,category_name,subcategory,image_data_url,input_context,correction_text,expected_output,rating_score,usage_count,created_at&category_name=eq.${encodeURIComponent(normalizeName(category))}&order=rating_score.desc,created_at.desc&limit=8`,
-    { headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}` } }
-  )
-
-  const data = await r.json().catch(() => [])
-  return pickRelevantRows(Array.isArray(data) ? data : [], subcategory).slice(0, 4)
-}
-
-async function fetchFeedbackNotes({ SB_URL, SB_KEY, category, subcategory }) {
-  const r = await fetch(
-    `${SB_URL}/rest/v1/job_feedback?select=id,category_name,subcategory,rating,notes,created_at&category_name=eq.${encodeURIComponent(normalizeName(category))}&order=created_at.desc&limit=12`,
-    { headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}` } }
-  )
-
-  const data = await r.json().catch(() => [])
-  return pickRelevantRows(Array.isArray(data) ? data : [], subcategory)
-    .filter(item => normalizeText(item.notes))
-    .slice(0, 6)
-}
-
-function buildExampleText(example, index) {
-  return [
-    `TRAINING EXAMPLE ${index + 1}`,
-    `Category: ${normalizeText(example.category_name)}`,
-    `Subcategory: ${normalizeText(example.subcategory) || '[generic]'}`,
-    `Context: ${normalizeText(example.input_context) || '[none]'}`,
-    `Correction: ${normalizeText(example.correction_text)}`,
-    `Expected output: ${
-      example.expected_output
-        ? typeof example.expected_output === 'string'
-          ? example.expected_output
-          : JSON.stringify(example.expected_output)
-        : '[none]'
-    }`,
-  ].join('\n')
-}
-
 function normalizeProduct(product = {}, memory = EMPTY_MEMORY, category = 'default', subcategory = '') {
   const row = { ...product }
 
@@ -299,7 +245,7 @@ function normalizeProduct(product = {}, memory = EMPTY_MEMORY, category = 'defau
   }
 }
 
-function buildMessages(category, subcategory, pages, memory, trainingExamples, feedbackNotes) {
+function buildMessages(category, subcategory, pages, memory) {
   const content = [
     {
       type: 'text',
@@ -316,7 +262,7 @@ Critical rules:
 6. Parse dimensions into length_mm, width_mm, thickness_mm whenever possible.
 7. Required business fields: sku, name, length_mm, width_mm, thickness_mm, subcategory, color, look.
 8. Use common pages to update memory_update instead of inventing products.
-9. Use prior memory and training examples when a later page omits shared details.
+9. Use prior memory when a later page omits shared details.
 10. Return strict JSON only.`,
     },
     {
@@ -324,30 +270,6 @@ Critical rules:
       text: `CATEGORY: ${normalizeText(category)}\nSUBCATEGORY: ${normalizeText(subcategory) || '[optional-empty]'}\n\nPRIOR MEMORY:\n${JSON.stringify(mergeMemory(EMPTY_MEMORY, memory), null, 2)}`,
     },
   ]
-
-  if (trainingExamples.length) {
-    content.push({
-      type: 'text',
-      text: `FOLLOW THESE USER TRAINING EXAMPLES CAREFULLY. They override weak guesses when the page layout matches.`,
-    })
-
-    trainingExamples.forEach((example, index) => {
-      content.push({ type: 'text', text: buildExampleText(example, index) })
-      if (example.image_data_url && index < 2) {
-        content.push({
-          type: 'image_url',
-          image_url: { url: example.image_data_url, detail: 'low' },
-        })
-      }
-    })
-  }
-
-  if (feedbackNotes.length) {
-    content.push({
-      type: 'text',
-      text: `RECENT USER RATING NOTES TO FOLLOW:\n${feedbackNotes.map(item => `- [${item.rating}/5] ${normalizeText(item.notes)}`).join('\n')}`,
-    })
-  }
 
   for (const page of pages) {
     content.push({
@@ -388,19 +310,23 @@ export default async function handler(req, res) {
   }
 
   const apiKey = process.env.OPENAI_API_KEY
-  const model = process.env.OPENAI_MODEL || 'gpt-4o-mini'
-  const SB_URL = process.env.VITE_SUPABASE_URL
-  const SB_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY
+  const model = process.env.OPENAI_MODEL || 'gpt-5'
 
   if (!apiKey) return res.status(500).json({ error: 'OPENAI_API_KEY not set' })
 
   try {
-    const [trainingExamples, feedbackNotes] = SB_URL && SB_KEY
-      ? await Promise.all([
-          fetchTrainingExamples({ SB_URL, SB_KEY, category, subcategory }).catch(() => []),
-          fetchFeedbackNotes({ SB_URL, SB_KEY, category, subcategory }).catch(() => []),
-        ])
-      : [[], []]
+    const requestBody = {
+      model,
+      response_format: {
+        type: 'json_schema',
+        json_schema: OUTPUT_SCHEMA,
+      },
+      messages: buildMessages(category, subcategory, pages, memory),
+    }
+
+    if (!model.startsWith('gpt-5')) {
+      requestBody.temperature = 0
+    }
 
     const aiRes = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
@@ -408,15 +334,7 @@ export default async function handler(req, res) {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${apiKey}`,
       },
-      body: JSON.stringify({
-        model,
-        temperature: 0,
-        response_format: {
-          type: 'json_schema',
-          json_schema: OUTPUT_SCHEMA,
-        },
-        messages: buildMessages(category, subcategory, pages, memory, trainingExamples, feedbackNotes),
-      }),
+      body: JSON.stringify(requestBody),
     })
 
     const raw = await aiRes.text()
@@ -458,8 +376,6 @@ export default async function handler(req, res) {
       count: products.length,
       page_analysis: parsed.page_analysis || [],
       memory: mergedMemory,
-      training_examples_used: trainingExamples.length,
-      feedback_notes_used: feedbackNotes.length,
     })
   } catch (error) {
     return res.status(500).json({ error: String(error?.message || error) })

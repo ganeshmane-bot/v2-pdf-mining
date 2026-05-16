@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Link } from 'react-router-dom'
-import { supabase } from '../lib/supabase.js'
+import { supabase } from '../src/lib/supabase.js'
 
 const PDFJS = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js'
 const WORKER = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'
@@ -10,12 +9,19 @@ const CHUNK_SIZE = 4
 const CAT_COLORS = {
   tiles: '#f59e0b',
   laminates: '#10b981',
-  panels: '#3b82f6',
-  louvers: '#8b5cf6',
-  wallpapers: '#ec4899',
+  'louvers/panels': '#8b5cf6',
+  wallpaper: '#ec4899',
   quartz: '#f97316',
   custom: '#94a3b8',
 }
+
+const CATEGORY_OPTIONS = [
+  { label: 'Tiles', value: 'tiles' },
+  { label: 'Laminates', value: 'laminates' },
+  { label: 'Louvers/panels', value: 'louvers/panels' },
+  { label: 'Wallpaper', value: 'wallpaper' },
+  { label: 'Quartz', value: 'quartz' },
+]
 
 async function loadPdfJs() {
   if (window.pdfjsLib) return window.pdfjsLib
@@ -116,7 +122,17 @@ function normalizeName(value) {
   return String(value || '').trim().toLowerCase().replace(/\s+/g, ' ')
 }
 
-export default function Workspace({ session }) {
+function findCategoryId(categories, name) {
+  const normalized = normalizeName(name)
+  const aliases = {
+    wallpaper: ['wallpaper', 'wallpapers'],
+    'louvers/panels': ['louvers/panels', 'louvers', 'panels'],
+  }
+  const candidates = aliases[normalized] || [normalized]
+  return categories.find(category => candidates.includes(normalizeName(category.name)))?.id || ''
+}
+
+export default function Workspace({ session, onBack }) {
   const fileInputRef = useRef(null)
   const abortRef = useRef(null)
   const stopRequestedRef = useRef(false)
@@ -139,11 +155,6 @@ export default function Workspace({ session }) {
   const [jobId, setJobId] = useState(null)
   const [error, setError] = useState('')
   const [page, setPage] = useState(0)
-
-  const [rating, setRating] = useState(0)
-  const [ratingNotes, setRatingNotes] = useState('')
-  const [ratingSaved, setRatingSaved] = useState(false)
-  const [ratingError, setRatingError] = useState('')
 
   const ROW_PER_PAGE = 20
   const email = session?.user?.email || ''
@@ -185,9 +196,6 @@ export default function Workspace({ session }) {
       setError('')
       setRows([])
       setCsvStr('')
-      setRating(0)
-      setRatingNotes('')
-      setRatingSaved(false)
     } else {
       setError('Please upload a PDF file only.')
     }
@@ -219,10 +227,6 @@ export default function Workspace({ session }) {
     setRows([])
     setCsvStr('')
     setPage(0)
-    setRating(0)
-    setRatingNotes('')
-    setRatingSaved(false)
-    setRatingError('')
     setJobId(null)
 
     try {
@@ -235,8 +239,8 @@ export default function Workspace({ session }) {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             pdf_name: file.name,
-            category_id: customCategoryMode ? null : categoryId,
-            custom_category_name: customCategoryMode ? customCategoryName : '',
+            category_id: customCategoryMode ? null : (categoryId || null),
+            custom_category_name: customCategoryMode ? customCategoryName : (categoryId ? '' : activeCategoryName),
             subcategory,
           }),
         })
@@ -306,7 +310,7 @@ export default function Workspace({ session }) {
       abortRef.current = null
 
       if (!extracted.length) {
-        throw new Error('No products found — add a training example for this catalog layout if needed.')
+        throw new Error('No products found in this PDF.')
       }
 
       extracted.sort((a, b) => {
@@ -355,36 +359,6 @@ export default function Workspace({ session }) {
     }
   }
 
-  async function submitRating() {
-    if (!rows.length || !activeCategoryName || !rating) {
-      setRatingError('Choose a rating first.')
-      return
-    }
-
-    setRatingError('')
-
-    try {
-      const r = await fetch('/api/training/rate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          job_id: jobId,
-          category_name: activeCategoryName,
-          subcategory,
-          rating,
-          notes: ratingNotes,
-        }),
-      })
-
-      const data = await r.json().catch(() => ({}))
-      if (!r.ok) throw new Error(data.error || 'Could not save rating')
-
-      setRatingSaved(true)
-    } catch (err) {
-      setRatingError(String(err?.message || err))
-    }
-  }
-
   async function logout() {
     await supabase.auth.signOut()
   }
@@ -419,13 +393,10 @@ export default function Workspace({ session }) {
             color: '#0f1117',
           }}>M</div>
           <span style={{ fontWeight: 700, fontSize: 15 }}>Material Depot</span>
-          <span style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--muted)' }}>/ PDF Miner</span>
+          <span style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--muted)' }}>/ PDF Scraping</span>
         </div>
 
-        <div style={{ display: 'flex', gap: 8 }}>
-          <Link className="btn btn-ghost" to="/" style={{ color: 'var(--text)' }}>Workspace</Link>
-          <Link className="btn btn-ghost" to="/training">Training</Link>
-        </div>
+        <button className="btn btn-ghost" onClick={onBack} style={{ fontSize: 13 }}>← Tools</button>
 
         <button className="btn btn-ghost" onClick={logout} style={{ fontSize: 13 }}>
           {initials} · {email.split('@')[0]} · Sign out
@@ -511,17 +482,17 @@ export default function Workspace({ session }) {
                     PRODUCT CATEGORY
                   </div>
                   <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-                    {categories.map(category => {
-                      const color = CAT_COLORS[category.name] || 'var(--amber)'
-                      const selected = !customCategoryMode && categoryId === category.id
+                    {CATEGORY_OPTIONS.map(category => {
+                      const color = CAT_COLORS[category.value] || 'var(--amber)'
+                      const selected = !customCategoryMode && activeCategoryName === category.value
                       return (
                         <button
-                          key={category.id}
+                          key={category.value}
                           onClick={() => {
                             setCustomCategoryMode(false)
                             setCustomCategoryName('')
-                            setCategoryId(category.id)
-                            setCategoryName(category.name)
+                            setCategoryId(findCategoryId(categories, category.value))
+                            setCategoryName(category.value)
                           }}
                           style={{
                             padding: '7px 14px',
@@ -535,7 +506,7 @@ export default function Workspace({ session }) {
                             cursor: 'pointer',
                           }}
                         >
-                          {category.name}
+                          {category.label}
                         </button>
                       )
                     })}
@@ -557,7 +528,7 @@ export default function Workspace({ session }) {
                         cursor: 'pointer',
                       }}
                     >
-                      Custom category
+                      Custom Category
                     </button>
                   </div>
                 </div>
@@ -573,7 +544,7 @@ export default function Workspace({ session }) {
 
                 <input
                   className="inp"
-                  placeholder="Optional subcategory"
+                  placeholder="Optional subcategory / brand"
                   value={subcategory}
                   onChange={event => setSubcategory(event.target.value)}
                 />
@@ -634,43 +605,6 @@ export default function Workspace({ session }) {
                 <button className="btn btn-primary" onClick={() => downloadCsv(csvStr, `${file.name.replace('.pdf', '')}_${activeCategoryName}.csv`)}>
                   ↓ Download CSV
                 </button>
-              </div>
-
-              <div style={{ padding: '16px 24px', borderBottom: '1px solid var(--border)', background: 'var(--bg)' }}>
-                <div style={{ fontWeight: 700, marginBottom: 10 }}>Rate this extraction</div>
-                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 10 }}>
-                  {[1, 2, 3, 4, 5].map(value => (
-                    <button
-                      key={value}
-                      className="btn btn-outline"
-                      onClick={() => setRating(value)}
-                      style={{
-                        padding: '8px 12px',
-                        borderColor: rating === value ? 'var(--amber)' : 'var(--border)',
-                        color: rating === value ? 'var(--amber)' : 'var(--text)',
-                      }}
-                    >
-                      {'★'.repeat(value)}
-                    </button>
-                  ))}
-                </div>
-
-                <textarea
-                  className="inp"
-                  rows={3}
-                  placeholder="Optional note. Example: missed flooring size on pages without printed code, or got the color family wrong."
-                  value={ratingNotes}
-                  onChange={e => setRatingNotes(e.target.value)}
-                  style={{ resize: 'vertical', marginBottom: 10 }}
-                />
-
-                <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                  <button className="btn btn-primary" onClick={submitRating} disabled={ratingSaved || !rating}>
-                    {ratingSaved ? 'Rating saved' : 'Save rating'}
-                  </button>
-                  <Link className="btn btn-outline" to="/training">Open Training Page</Link>
-                  {ratingError ? <span style={{ color: 'var(--red)', fontSize: 13 }}>{ratingError}</span> : null}
-                </div>
               </div>
 
               <div style={{ overflowX: 'auto' }}>
@@ -750,9 +684,14 @@ export default function Workspace({ session }) {
                       <td style={{ padding: '12px 20px', color: 'var(--amber)', fontWeight: 600 }}>{job.row_count || 0}</td>
                       <td style={{ padding: '12px 20px', color: 'var(--muted)', fontSize: 12, fontFamily: 'var(--mono)' }}>{new Date(job.created_at).toLocaleDateString()}</td>
                       <td style={{ padding: '12px 20px' }}>
-                        {job.csv_output
-                          ? <button className="btn btn-outline" onClick={() => downloadCsv(job.csv_output, `${job.pdf_name.replace('.pdf', '')}.csv`)} style={{ padding: '5px 12px', fontSize: 12 }}>↓ CSV</button>
-                          : <span style={{ color: 'var(--muted)' }}>—</span>}
+                        <button
+                          className="btn btn-outline"
+                          onClick={() => downloadCsv(job.csv_output, `${job.pdf_name.replace('.pdf', '')}.csv`)}
+                          disabled={!job.csv_output}
+                          style={{ padding: '5px 12px', fontSize: 12, whiteSpace: 'nowrap' }}
+                        >
+                          Download CSV
+                        </button>
                       </td>
                     </tr>
                   ))}

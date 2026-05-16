@@ -10,7 +10,7 @@ export default async function handler(req, res) {
 
   if (!pdf_name) return res.status(400).json({ error: 'Missing pdf_name' })
 
-  const SB_URL = process.env.VITE_SUPABASE_URL
+  const SB_URL = process.env.NEXT_PUBLIC_SUPABASE_URL
   const SB_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY
 
   if (!SB_URL || !SB_KEY) {
